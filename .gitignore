@@ -1,0 +1,17 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$*.py
+
+# Virtual Environments
+.venv/
+venv/
+ENV/
+
+# IDE files
+.vscode/
+.idea/
+
+# Temporary files
+check_naver_api.py
+check_cov.py
