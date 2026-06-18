@@ -51,6 +51,49 @@ def _fetch_json(url: str) -> dict:
         return json.loads(r.read().decode("utf-8"))
 
 
+def _fetch_json_polling(url: str) -> dict:
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        content = r.read()
+        try:
+            return json.loads(content.decode("cp949"))
+        except Exception:
+            return json.loads(content.decode("utf-8", errors="ignore"))
+
+
+def _fetch_realtime_price(code: str) -> tuple:
+    """네이버 실시간 폴링 API를 사용하여 실시간 현재가와 등락률을 조회"""
+    try:
+        url = f"https://polling.finance.naver.com/api/realtime?query=SERVICE_ITEM:{code}"
+        res = _fetch_json_polling(url)
+        result = res.get("result", {})
+        areas = result.get("areas", [])
+        if areas and isinstance(areas, list):
+            datas = areas[0].get("datas", [])
+            if datas and isinstance(datas, list):
+                data = datas[0]
+                nv = data.get("nv")
+                pcv = data.get("pcv")
+                cr = data.get("cr")
+                if nv is not None and nv > 0:
+                    close_price = f"{nv:,}"
+                    if pcv is not None and pcv > 0:
+                        diff = nv - pcv
+                        if diff < 0:
+                            ratio = -abs(cr) if cr is not None else 0.0
+                        elif diff > 0:
+                            ratio = abs(cr) if cr is not None else 0.0
+                        else:
+                            ratio = 0.0
+                    else:
+                        ratio = 0.0
+                    ratio_str = f"{ratio:+.2f}" if ratio != 0.0 else "0.00"
+                    return close_price, ratio_str
+    except Exception:
+        pass
+    return None, None
+
+
 def _get_annual_dividends(divs) -> dict:
     if divs is None or divs.empty:
         return {}
@@ -93,18 +136,20 @@ def _get_annual_dividends(divs) -> dict:
     return annual_sums
 
 
-def _fetch_details(code: str) -> tuple:
-    """단일 종목의 (52주 최저, 52주 최고, 배당금, 배당수익률, 배당기준일, 1년전배당, 2년전배당, 3년전배당) 조회. 실패 시 대치."""
+def _fetch_naver_details(code: str) -> tuple:
+    """Naver API만 사용하여 52주 최저/최고, 배당금, 배당수익률, 배당기준일을 즉시 조회 (매우 빠름)"""
     try:
-        # 1. Naver API
         d = _fetch_json(NAVER_INTEGRATION.format(code=code))
         
-        # Parse closePrice (needed for ETF yield calculation)
-        close_price = d.get("closePrice", "-")
-        if close_price == "-" or close_price is None:
-            trends = d.get("dealTrendInfos", [])
-            if trends and isinstance(trends, list):
-                close_price = trends[0].get("closePrice", "-")
+        realtime_price, _ = _fetch_realtime_price(code)
+        if realtime_price is not None:
+            close_price = realtime_price
+        else:
+            close_price = d.get("closePrice", "-")
+            if close_price == "-" or close_price is None:
+                trends = d.get("dealTrendInfos", [])
+                if trends and isinstance(trends, list):
+                    close_price = trends[0].get("closePrice", "-")
                 
         lo = hi = div = div_yield = div_dt = "-"
         for t in d.get("totalInfos", []):
@@ -121,74 +166,81 @@ def _fetch_details(code: str) -> tuple:
             elif c == "dividendYieldRatio":
                 div_yield = t.get("value", "-")
         
-        # Clean up "N/A"
         if lo == "N/A": lo = "-"
         if hi == "N/A": hi = "-"
         if div == "N/A": div = "-"
         if div_yield == "N/A": div_yield = "-"
         if div_dt == "N/A": div_dt = "-"
-
-        # 2. yfinance for past dividends
-        div_y1 = div_y2 = div_y3 = "-"
         
-        # Determine the base year from the current dividend date (e.g. 2025 from "2025.12")
-        base_year = 2025
-        if div_dt != "-" and len(div_dt) >= 4 and div_dt[:4].isdigit():
-            base_year = int(div_dt[:4])
-            
-        try:
-            ticker = yf.Ticker(f"{code}.KS")
-            divs = ticker.dividends
-            if divs.empty:
-                ticker = yf.Ticker(f"{code}.KQ")
-                divs = ticker.dividends
-            
-            if not divs.empty:
-                annual = _get_annual_dividends(divs)
-                
-                # If Naver dividend is missing (typical for ETFs), fill it using yfinance
-                if div == "-":
-                    latest_year = divs.index[-1].year
-                    base_year = latest_year
-                    
-                    latest_date = divs.index[-1]
-                    div_dt = latest_date.strftime("%Y.%m")
-                    
-                    val_base = annual.get(base_year, 0)
-                    div = f"{val_base:,.0f}원" if val_base > 0 else "-"
-                    
-                    # Calculate dividend yield from trailing 12-month (TTM) distributions
-                    try:
-                        price_str = str(close_price).replace(",", "")
-                        price_val = float(price_str)
-                        if price_val > 0:
-                            now_tz = datetime.datetime.now(divs.index.tz)
-                            one_year_ago = now_tz - datetime.timedelta(days=365)
-                            recent_sum = divs[divs.index >= one_year_ago].sum()
-                            
-                            div_yield_val = (recent_sum / price_val) * 100
-                            div_yield = f"{div_yield_val:.2f}%"
-                    except Exception:
-                        pass
-                
-                # 1 year ago starts from base_year - 1 (e.g. 2024 if current dividend is 2025)
-                y1 = base_year - 1
-                y2 = base_year - 2
-                y3 = base_year - 3
-                
-                val_y1 = annual.get(y1, 0)
-                val_y2 = annual.get(y2, 0)
-                val_y3 = annual.get(y3, 0)
-                
-                div_y1 = f"{val_y1:,.0f}원" if val_y1 > 0 else "-"
-                div_y2 = f"{val_y2:,.0f}원" if val_y2 > 0 else "-"
-                div_y3 = f"{val_y3:,.0f}원" if val_y3 > 0 else "-"
-        except Exception:
-            pass
-            
-        return lo, hi, div, div_yield, div_dt, div_y1, div_y2, div_y3
+        return lo, hi, div, div_yield, div_dt, close_price
     except Exception:
-        return "-", "-", "-", "-", "-", "-", "-", "-"
+        return "-", "-", "-", "-", "-", "-"
+
+
+def _fetch_yfinance_dividends(code: str, close_price: str, div: str, div_yield: str, div_dt: str) -> tuple:
+    """yfinance를 사용하여 과거 1~3년 전 배당금을 조회 (상대적으로 느림)"""
+    div_y1 = div_y2 = div_y3 = "-"
+    base_year = 2025
+    if div_dt != "-" and len(div_dt) >= 4 and div_dt[:4].isdigit():
+        base_year = int(div_dt[:4])
+        
+    try:
+        ticker = yf.Ticker(f"{code}.KS")
+        divs = ticker.dividends
+        if divs.empty:
+            ticker = yf.Ticker(f"{code}.KQ")
+            divs = ticker.dividends
+        
+        if not divs.empty:
+            annual = _get_annual_dividends(divs)
+            
+            latest_date = divs.index[-1]
+            latest_year = latest_date.year
+            current_year = datetime.datetime.now().year
+            
+            if div == "-" and latest_year >= current_year - 1:
+                base_year = latest_year
+                div_dt = latest_date.strftime("%Y.%m")
+                
+                val_base = annual.get(base_year, 0)
+                div = f"{val_base:,.0f}원" if val_base > 0 else "-"
+                
+                # Calculate dividend yield from trailing 12-month (TTM) distributions
+                try:
+                    price_str = str(close_price).replace(",", "")
+                    price_val = float(price_str)
+                    if price_val > 0:
+                        now_tz = datetime.datetime.now(divs.index.tz)
+                        one_year_ago = now_tz - datetime.timedelta(days=365)
+                        recent_sum = divs[divs.index >= one_year_ago].sum()
+                        
+                        div_yield_val = (recent_sum / price_val) * 100
+                        div_yield = f"{div_yield_val:.2f}%"
+                except Exception:
+                    pass
+            
+            y1 = base_year - 1
+            y2 = base_year - 2
+            y3 = base_year - 3
+            
+            val_y1 = annual.get(y1, 0)
+            val_y2 = annual.get(y2, 0)
+            val_y3 = annual.get(y3, 0)
+            
+            div_y1 = f"{val_y1:,.0f}원" if val_y1 > 0 else "-"
+            div_y2 = f"{val_y2:,.0f}원" if val_y2 > 0 else "-"
+            div_y3 = f"{val_y3:,.0f}원" if val_y3 > 0 else "-"
+    except Exception:
+        pass
+        
+    return div, div_yield, div_dt, div_y1, div_y2, div_y3
+
+
+def _fetch_details(code: str) -> tuple:
+    """단일 종목의 전체 정보(52주 범위 및 1~3년 전 배당금까지) 조회. (동기 실행 및 내보내기용)"""
+    lo, hi, div, div_yield, div_dt, close_price = _fetch_naver_details(code)
+    div, div_yield, div_dt, div_y1, div_y2, div_y3 = _fetch_yfinance_dividends(code, close_price, div, div_yield, div_dt)
+    return lo, hi, div, div_yield, div_dt, div_y1, div_y2, div_y3
 
 
 
@@ -225,41 +277,48 @@ def _fetch_global_stock_info(code: str, name: str) -> dict:
         # 1. Naver API
         d = _fetch_json(NAVER_INTEGRATION.format(code=code))
         
-        # Parse closePrice
-        close_price = d.get("closePrice", "-")
-        if close_price == "-" or close_price is None:
-            trends = d.get("dealTrendInfos", [])
-            if trends and isinstance(trends, list):
-                close_price = trends[0].get("closePrice", "-")
-                
-        # Parse fluctuationsRatio
-        fluctuations_ratio = d.get("fluctuationsRatio", "0")
-        if fluctuations_ratio in ("0", 0, None, "-"):
-            trends = d.get("dealTrendInfos", [])
-            if trends and isinstance(trends, list):
-                try:
-                    curr_price_str = trends[0].get("closePrice", "0").replace(",", "")
-                    diff_str = trends[0].get("compareToPreviousClosePrice", "0").replace(",", "")
-                    curr_price = float(curr_price_str)
-                    diff = float(diff_str)
-                    compare_info = trends[0].get("compareToPreviousPrice", {})
-                    is_falling = False
-                    if isinstance(compare_info, dict):
-                        if compare_info.get("name") == "FALLING" or compare_info.get("code") == "5":
-                            is_falling = True
+        # Parse closePrice & fluctuationsRatio with realtime polling API first
+        realtime_price, realtime_ratio = _fetch_realtime_price(code)
+        
+        if realtime_price is not None:
+            close_price = realtime_price
+            fluctuations_ratio = realtime_ratio
+        else:
+            # Parse closePrice
+            close_price = d.get("closePrice", "-")
+            if close_price == "-" or close_price is None:
+                trends = d.get("dealTrendInfos", [])
+                if trends and isinstance(trends, list):
+                    close_price = trends[0].get("closePrice", "-")
                     
-                    if is_falling and diff > 0:
-                        diff = -diff
-                    elif not is_falling and diff < 0:
-                        diff = abs(diff)
+            # Parse fluctuationsRatio
+            fluctuations_ratio = d.get("fluctuationsRatio", "0")
+            if fluctuations_ratio in ("0", 0, None, "-"):
+                trends = d.get("dealTrendInfos", [])
+                if trends and isinstance(trends, list):
+                    try:
+                        curr_price_str = trends[0].get("closePrice", "0").replace(",", "")
+                        diff_str = trends[0].get("compareToPreviousClosePrice", "0").replace(",", "")
+                        curr_price = float(curr_price_str)
+                        diff = float(diff_str)
+                        compare_info = trends[0].get("compareToPreviousPrice", {})
+                        is_falling = False
+                        if isinstance(compare_info, dict):
+                            if compare_info.get("name") == "FALLING" or compare_info.get("code") == "5":
+                                is_falling = True
                         
-                    prev_price = curr_price - diff
-                    if prev_price > 0:
-                        fluctuations_ratio = round((diff / prev_price) * 100, 2)
-                    else:
+                        if is_falling and diff > 0:
+                            diff = -diff
+                        elif not is_falling and diff < 0:
+                            diff = abs(diff)
+                            
+                        prev_price = curr_price - diff
+                        if prev_price > 0:
+                            fluctuations_ratio = round((diff / prev_price) * 100, 2)
+                        else:
+                            fluctuations_ratio = 0.0
+                    except Exception:
                         fluctuations_ratio = 0.0
-                except Exception:
-                    fluctuations_ratio = 0.0
                 
         # Parse marketValueRaw
         market_value_raw = d.get("marketValueRaw", 0)
@@ -328,11 +387,13 @@ def _fetch_global_stock_info(code: str, name: str) -> dict:
                 annual = _get_annual_dividends(divs)
                 
                 # If Naver dividend is missing (typical for ETFs), fill it using yfinance
-                if div == "-":
-                    latest_year = divs.index[-1].year
+                # Only use yfinance data if the latest dividend is recent (within last year or this year)
+                latest_date = divs.index[-1]
+                latest_year = latest_date.year
+                current_year = datetime.datetime.now().year
+                
+                if div == "-" and latest_year >= current_year - 1:
                     base_year = latest_year
-                    
-                    latest_date = divs.index[-1]
                     div_dt = latest_date.strftime("%Y.%m")
                     
                     val_base = annual.get(base_year, 0)
@@ -428,10 +489,31 @@ class IndustrySectorSection:
         self._sort_col      = None
         self._sort_reverse  = False
         self._global_stocks_cache = {}
+        self._global_stocks_exchanges = {}
+        self._details_cache = {}
 
-    # ──────────────────────────────────────────────
-    # UI 구성
-    # ──────────────────────────────────────────────
+    def _safe_call(self, func, *args, **kwargs):
+        """Safely execute a UI update function if the root and main widgets still exist."""
+        try:
+            if hasattr(self, "root") and self.root and self.root.winfo_exists():
+                return func(*args, **kwargs)
+        except Exception:
+            pass
+
+    def _safe_after(self, delay: int, func, *args, **kwargs):
+        """Register a callback with after, but only execute it if the widget/root is not destroyed."""
+        def wrapper():
+            try:
+                if hasattr(self, "root") and self.root and self.root.winfo_exists():
+                    func(*args, **kwargs)
+            except Exception:
+                pass
+        try:
+            if hasattr(self, "root") and self.root and self.root.winfo_exists():
+                self.root.after(delay, wrapper)
+        except Exception:
+            pass
+
     def build(self, container: tk.Frame) -> None:
         frame = tk.LabelFrame(
             container,
@@ -476,10 +558,10 @@ class IndustrySectorSection:
         self.select_industry_btn.pack(side="left", padx=(0, 8))
 
         self.refresh_btn = tk.Button(
-            top_row, text="🔄 업종 목록",
+            top_row, text="🔄 전체 종목",
             font=("맑은 고딕", 9), bg=self.primary, fg=self.text_light,
             bd=0, relief="flat", cursor="hand2", padx=8, pady=4,
-            command=self._load_industries_thread,
+            command=self._load_all_stocks_thread,
         )
         self.refresh_btn.pack(side="left", padx=(0, 12))
 
@@ -559,10 +641,10 @@ class IndustrySectorSection:
                 self.tree.heading(col, text=col)
             self.tree.column(col, width=width, anchor=anchor, stretch=False)
 
-        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=vsb.set)
+        self.vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=self._on_tree_scroll)
         self.tree.pack(side="left", fill="both", expand=True)
-        vsb.pack(side="right", fill="y")
+        self.vsb.pack(side="right", fill="y")
 
         self.tree.tag_configure("rise", foreground="#E63B2E")
         self.tree.tag_configure("fall", foreground="#0055FF")
@@ -633,7 +715,117 @@ class IndustrySectorSection:
                 "업종 목록 오류", f"업종 목록 조회 실패:\n{msg}"))
         finally:
             self.root.after(0, lambda: self.refresh_btn.configure(
-                state="normal", text="🔄 업종 목록"))
+                state="normal", text="🔄 전체 종목"))
+
+    def _load_all_stocks_thread(self):
+        self.refresh_btn.configure(state="disabled", text="로딩 중...")
+        self.stats_lbl.configure(text="전체 종목 불러오는 중...", fg=self.text_muted)
+        threading.Thread(target=self._load_all_stocks, daemon=True).start()
+
+    def _load_all_stocks(self):
+        try:
+            # 캐시가 빈 경우 구축
+            if not self._global_stocks_cache:
+                self._build_global_stocks_cache()
+            
+            matched_stocks = list(self._global_stocks_cache.items())
+            if not matched_stocks:
+                self.root.after(0, lambda: messagebox.showwarning(
+                    "대기 필요", "종목 정보를 불러오는 중입니다. 잠시 후 다시 시도해 주세요."))
+                return
+
+            self._set_stats(f"실시간 시세 가져오는 중 (0/{len(matched_stocks)})...", self.text_muted)
+            
+            # 실시간 시세 일괄 조회 (100종목 단위 청크)
+            codes = [code for code, name in matched_stocks]
+            realtime_data = {}
+            
+            chunk_size = 100
+            chunks = [codes[i:i + chunk_size] for i in range(0, len(codes), chunk_size)]
+            
+            completed_count = 0
+            
+            def fetch_chunk(chunk_codes):
+                nonlocal completed_count
+                try:
+                    url = "https://polling.finance.naver.com/api/realtime?query=SERVICE_ITEM:" + ",".join(chunk_codes)
+                    res = _fetch_json_polling(url)
+                    result = res.get("result", {})
+                    areas = result.get("areas", [])
+                    chunk_res = {}
+                    if areas and isinstance(areas, list):
+                        datas = areas[0].get("datas", [])
+                        for data in datas:
+                            cd = data.get("cd")
+                            nv = data.get("nv")
+                            pcv = data.get("pcv")
+                            cr = data.get("cr")
+                            count_listed = data.get("countOfListedStock", 0)
+                            
+                            mkt_val = 0
+                            if nv is not None and count_listed:
+                                try:
+                                    mkt_val = int(nv) * int(count_listed)
+                                except Exception:
+                                    pass
+                                    
+                            if cd and nv is not None and nv > 0:
+                                close_price = f"{nv:,}"
+                                if pcv is not None and pcv > 0:
+                                    diff = nv - pcv
+                                    if diff < 0:
+                                        ratio = -abs(cr) if cr is not None else 0.0
+                                    elif diff > 0:
+                                        ratio = abs(cr) if cr is not None else 0.0
+                                    else:
+                                        ratio = 0.0
+                                else:
+                                    ratio = 0.0
+                                ratio_str = f"{ratio:+.2f}" if ratio != 0.0 else "0.00"
+                                chunk_res[cd] = (close_price, ratio_str, mkt_val)
+                    return chunk_res
+                except Exception:
+                    return {}
+
+            final_stocks = []
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                futures = [executor.submit(fetch_chunk, chunk) for chunk in chunks]
+                for fut in as_completed(futures):
+                    res = fut.result()
+                    realtime_data.update(res)
+                    completed_count += len(res)
+                    self._set_stats(f"실시간 시세 가져오는 중 ({completed_count}/{len(matched_stocks)})...", self.text_muted)
+            
+            exchanges_cache = getattr(self, "_global_stocks_exchanges", {})
+            
+            for code, name in matched_stocks:
+                close_price, fluctuations_ratio, mkt_val = realtime_data.get(code, ("-", "0.00", 0))
+                ex_code_val = exchanges_cache.get(code, "KS")
+                final_stocks.append({
+                    "stockName": name,
+                    "itemCode": code,
+                    "closePrice": close_price,
+                    "fluctuationsRatio": fluctuations_ratio,
+                    "marketValueRaw": mkt_val,
+                    "stockExchangeType": {"code": ex_code_val},
+                })
+            
+            final_stocks = sorted(final_stocks, key=lambda s: s.get("stockName", ""))
+            
+            self._stocks = final_stocks
+            self._all_stocks = list(final_stocks)
+            self._current_group = None
+            self._sort_col = None
+            self._sort_reverse = False
+            
+            self.root.after(0, lambda: self._populate_tree(group=None))
+            self.root.after(0, lambda: self.stats_lbl.configure(text=f"📊 전체 종목: 총 {len(final_stocks)}종목", fg=self.text_dark))
+        except Exception as e:
+            err_msg = str(e)
+            self.root.after(0, lambda msg=err_msg: messagebox.showerror("전체 종목 오류", f"전체 종목을 불러오는 중 오류 발생:\n{msg}"))
+            self.root.after(0, lambda msg=err_msg: self.stats_lbl.configure(text=f"오류: {msg}", fg="#E63B2E"))
+        finally:
+            self.root.after(0, lambda: self.refresh_btn.configure(state="normal", text="🔄 전체 종목"))
 
     def _init_industry_list(self):
         self._all_raw     = [g["name"] for g in self._groups]
@@ -650,6 +842,7 @@ class IndustrySectorSection:
         if not self._groups:
             return
         temp_cache = {}
+        temp_exchanges = {}
         def fetch_group_stocks(g):
             try:
                 return _fetch_all_sector_stocks(g["no"])
@@ -657,16 +850,79 @@ class IndustrySectorSection:
                 return []
         try:
             with ThreadPoolExecutor(max_workers=16) as executor:
-                futures = [executor.submit(fetch_group_stocks, g) for g in self._groups]
+                # Map futures to their groups
+                futures = {executor.submit(fetch_group_stocks, g): g for g in self._groups}
+                
+                # Fetch all ETFs in parallel (pages 1 to 15)
+                etf_futures = []
+                for p in range(1, 16):
+                    etf_url = f"https://m.stock.naver.com/api/stocks/etf?page={p}&pageSize=100"
+                    etf_futures.append(executor.submit(_fetch_json, etf_url))
+                
                 for fut in as_completed(futures):
-                    for s in fut.result():
+                    g = futures[fut]
+                    stocks = fut.result()
+                    
+                    # Calculate stats manually
+                    def get_ratio(s):
+                        val = s.get("fluctuationsRatio", 0)
+                        try:
+                            return float(val)
+                        except (ValueError, TypeError):
+                            return 0.0
+                            
+                    g['totalCount'] = len(stocks)
+                    g['riseCount'] = sum(1 for s in stocks if get_ratio(s) > 0)
+                    g['fallCount'] = sum(1 for s in stocks if get_ratio(s) < 0)
+                    g['steadyCount'] = sum(1 for s in stocks if get_ratio(s) == 0)
+                    ratios = [get_ratio(s) for s in stocks]
+                    g['changeRate'] = sum(ratios) / len(ratios) if ratios else 0.0
+                    
+                    for s in stocks:
                         code = s.get("itemCode")
                         name = s.get("stockName")
                         if code and name and code.isdigit() and len(code) == 6:
                             temp_cache[code] = name
+                            temp_exchanges[code] = _ex_code(s)
+                            
+                for fut in as_completed(etf_futures):
+                    try:
+                        res = fut.result()
+                        etf_stocks = res.get("stocks", [])
+                        for s in etf_stocks:
+                            code = s.get("itemCode")
+                            name = s.get("stockName")
+                            if code and name and code.isdigit() and len(code) == 6:
+                                temp_cache[code] = name
+                                temp_exchanges[code] = _ex_code(s)
+                    except Exception:
+                        pass
+                        
             self._global_stocks_cache = temp_cache
+            self._global_stocks_exchanges = temp_exchanges
+            # Rebuild display names and trigger UI update
+            self.root.after(0, self._update_industry_list_ui)
         except Exception:
             pass
+
+    def _update_industry_list_ui(self):
+        selected_group_name = None
+        if self._current_group:
+            selected_group_name = self._current_group["name"]
+            
+        self._all_display = [f"{g['name']}  ({g['totalCount']}종목)"
+                             for g in self._groups]
+        self._display_to_group = dict(zip(self._all_display, self._groups))
+        
+        # If the currently selected group is in the new list, update the entry display
+        if selected_group_name:
+            for display in self._all_display:
+                group = self._display_to_group.get(display)
+                if group and group["name"] == selected_group_name:
+                    self.industry_var.set(display)
+                    # Also update the stats label if it was showing stats for the current group
+                    self._populate_stats(group)
+                    break
 
     def _open_industry_selector(self) -> None:
         if not self._all_display:
@@ -887,13 +1143,54 @@ class IndustrySectorSection:
             self._all_stocks = list(stocks)
             self._sort_col = None
             self._sort_reverse = False
-            self.root.after(0, lambda g=group: self._populate_tree(g))
+            
+            # Calculate stats manually
+            def get_ratio(s):
+                val = s.get("fluctuationsRatio", 0)
+                try:
+                    return float(val)
+                except (ValueError, TypeError):
+                    return 0.0
+                    
+            group['totalCount'] = len(stocks)
+            group['riseCount'] = sum(1 for s in stocks if get_ratio(s) > 0)
+            group['fallCount'] = sum(1 for s in stocks if get_ratio(s) < 0)
+            group['steadyCount'] = sum(1 for s in stocks if get_ratio(s) == 0)
+            ratios = [get_ratio(s) for s in stocks]
+            group['changeRate'] = sum(ratios) / len(ratios) if ratios else 0.0
+            
+            self._safe_after(0, lambda g=group: self._populate_tree(g))
+            self._safe_after(0, lambda g=group: self._update_single_group_in_displays(g))
         except Exception as e:
             err_msg = str(e)
-            self.root.after(0, lambda msg=err_msg: self.stats_lbl.configure(
-                text=f"오류: {msg}", fg="#E63B2E"))
+            self._safe_after(0, lambda msg=err_msg: self.stats_lbl.configure(
+                text=f"오류: {msg}", fg="#E63B2E") if hasattr(self, "stats_lbl") and self.stats_lbl and self.stats_lbl.winfo_exists() else None)
+
+    def _update_single_group_in_displays(self, group: dict):
+        try:
+            if not hasattr(self, "root") or not self.root or not self.root.winfo_exists():
+                return
+        except Exception:
+            return
+        self._all_display = [f"{g['name']}  ({g['totalCount']}종목)"
+                             for g in self._groups]
+        self._display_to_group = dict(zip(self._all_display, self._groups))
+        for display in self._all_display:
+            g = self._display_to_group.get(display)
+            if g and g["no"] == group["no"]:
+                try:
+                    if hasattr(self, "industry_var") and self.industry_var:
+                        self.industry_var.set(display)
+                except Exception:
+                    pass
+                break
 
     def _populate_tree(self, group: dict = None):
+        try:
+            if not hasattr(self, "tree") or not self.tree or not self.tree.winfo_exists():
+                return
+        except Exception:
+            return
         self._update_headers()
         for row in self.tree.get_children():
             self.tree.delete(row)
@@ -961,21 +1258,77 @@ class IndustrySectorSection:
         threading.Thread(target=self._fetch_details_all,
                          args=(self._stocks, token), daemon=True).start()
 
-    def _fetch_details_all(self, stocks: list, token: int):
-        def work(i_s):
-            i, s = i_s
-            lo, hi, div, div_yield, div_dt, div_y1, div_y2, div_y3 = _fetch_details(s.get("itemCode", ""))
-            return i, lo, hi, div, div_yield, div_dt, div_y1, div_y2, div_y3
+        if len(self._stocks) > 150:
+            self.root.after(100, self._lazy_load_current_viewport)
 
-        targets = [(i, s) for i, s in enumerate(stocks)
-                   if "_low52" not in s]
+    def _fetch_details_all(self, stocks: list, token: int):
+        # 1. Check cache first
+        for i, s in enumerate(stocks):
+            code = s.get("itemCode", "")
+            if code in self._details_cache:
+                c = self._details_cache[code]
+                s["_low52"] = c["lo"]
+                s["_high52"] = c["hi"]
+                s["_dividend"] = c["div"]
+                s["_div_yield"] = c["div_yield"]
+                s["_div_dt"] = c["div_dt"]
+                s["_div_y1"] = c["div_y1"]
+                s["_div_y2"] = c["div_y2"]
+                s["_div_y3"] = c["div_y3"]
+                self.root.after(0, self._update_details_row, i, c["lo"], c["hi"], c["div"], c["div_yield"], c["div_dt"], c["div_y1"], c["div_y2"], c["div_y3"], token)
+
+        # 2. Identify targets for Naver API (Phase 1)
+        targets_naver = [(i, s) for i, s in enumerate(stocks) if s.get("itemCode", "") not in self._details_cache]
+        if not targets_naver:
+            return
+
+        # Optimization: Skip background details fetching if there are too many stocks (avoid rate limits/freezing)
+        if len(stocks) > 150:
+            return
+
+        def work_naver(i_s):
+            i, s = i_s
+            code = s.get("itemCode", "")
+            lo, hi, div, div_yield, div_dt, close_price = _fetch_naver_details(code)
+            return i, code, lo, hi, div, div_yield, div_dt, close_price
+
+        # Phase 1: Fetch Naver details (lo, hi, div, div_yield, div_dt) in parallel
+        naver_results = []
         try:
-            with ThreadPoolExecutor(max_workers=12) as ex:
-                futs = [ex.submit(work, t) for t in targets]
+            with ThreadPoolExecutor(max_workers=16) as ex:
+                futs = [ex.submit(work_naver, t) for t in targets_naver]
                 for fut in as_completed(futs):
                     if token != self._load_token:
                         return
-                    i, lo, hi, div, div_yield, div_dt, div_y1, div_y2, div_y3 = fut.result()
+                    i, code, lo, hi, div, div_yield, div_dt, close_price = fut.result()
+                    
+                    stocks[i]["_low52"]  = lo
+                    stocks[i]["_high52"] = hi
+                    stocks[i]["_dividend"] = div
+                    stocks[i]["_div_yield"] = div_yield
+                    stocks[i]["_div_dt"] = div_dt
+                    
+                    # Update row immediately with Naver details (and "…" for yfinance)
+                    self.root.after(0, self._update_details_row, i, lo, hi, div, div_yield, div_dt, "…", "…", "…", token)
+                    naver_results.append((i, code, lo, hi, div, div_yield, div_dt, close_price))
+        except Exception:
+            pass
+
+        # Phase 2: Fetch yfinance details (div_y1, div_y2, div_y3) for those stocks
+        def work_yfinance(res):
+            i, code, lo, hi, div, div_yield, div_dt, close_price = res
+            div, div_yield, div_dt, div_y1, div_y2, div_y3 = _fetch_yfinance_dividends(code, close_price, div, div_yield, div_dt)
+            return i, code, lo, hi, div, div_yield, div_dt, div_y1, div_y2, div_y3
+
+        try:
+            # Using 4 workers for yfinance to be gentle
+            with ThreadPoolExecutor(max_workers=4) as ex:
+                futs = [ex.submit(work_yfinance, r) for r in naver_results]
+                for fut in as_completed(futs):
+                    if token != self._load_token:
+                        return
+                    i, code, lo, hi, div, div_yield, div_dt, div_y1, div_y2, div_y3 = fut.result()
+                    
                     stocks[i]["_low52"]  = lo
                     stocks[i]["_high52"] = hi
                     stocks[i]["_dividend"] = div
@@ -984,6 +1337,15 @@ class IndustrySectorSection:
                     stocks[i]["_div_y1"] = div_y1
                     stocks[i]["_div_y2"] = div_y2
                     stocks[i]["_div_y3"] = div_y3
+                    
+                    # Cache the result
+                    self._details_cache[code] = {
+                        "lo": lo, "hi": hi,
+                        "div": div, "div_yield": div_yield, "div_dt": div_dt,
+                        "div_y1": div_y1, "div_y2": div_y2, "div_y3": div_y3
+                    }
+                    
+                    # Update row with final values
                     self.root.after(0, self._update_details_row, i, lo, hi, div, div_yield, div_dt, div_y1, div_y2, div_y3, token)
         except Exception:
             pass
@@ -991,16 +1353,162 @@ class IndustrySectorSection:
     def _update_details_row(self, i, lo, hi, div, div_yield, div_dt, div_y1, div_y2, div_y3, token):
         if token != self._load_token:
             return
-        iid = str(i)
-        if self.tree.exists(iid):
-            self.tree.set(iid, "52주최저", lo)
-            self.tree.set(iid, "52주최고", hi)
-            self.tree.set(iid, "배당금", div)
-            self.tree.set(iid, "배당수익률", div_yield)
-            self.tree.set(iid, "배당기준일", div_dt)
-            self.tree.set(iid, "1년전 배당", div_y1)
-            self.tree.set(iid, "2년전 배당", div_y2)
-            self.tree.set(iid, "3년전 배당", div_y3)
+        try:
+            if not hasattr(self, "tree") or not self.tree or not self.tree.winfo_exists():
+                return
+            iid = str(i)
+            if self.tree.exists(iid):
+                self.tree.set(iid, "52주최저", lo)
+                self.tree.set(iid, "52주최고", hi)
+                self.tree.set(iid, "배당금", div)
+                self.tree.set(iid, "배당수익률", div_yield)
+                self.tree.set(iid, "배당기준일", div_dt)
+                self.tree.set(iid, "1년전 배당", div_y1)
+                self.tree.set(iid, "2년전 배당", div_y2)
+                self.tree.set(iid, "3년전 배당", div_y3)
+        except Exception:
+            pass
+
+    def _on_tree_scroll(self, first, last):
+        if hasattr(self, "vsb"):
+            try:
+                if self.vsb.winfo_exists():
+                    self.vsb.set(first, last)
+            except Exception:
+                pass
+            
+        # Debounce the viewport calculations and data fetching to avoid high-frequency API calls
+        if hasattr(self, "_lazy_load_job") and self._lazy_load_job:
+            try:
+                if self.root.winfo_exists():
+                    self.root.after_cancel(self._lazy_load_job)
+            except Exception:
+                pass
+            self._lazy_load_job = None
+            
+        self._lazy_load_job = self._safe_after(150, lambda: self._lazy_load_visible(float(first), float(last)))
+
+    def _lazy_load_current_viewport(self):
+        try:
+            first, last = self.tree.yview()
+            self._lazy_load_visible(first, last)
+        except Exception:
+            pass
+
+    def _lazy_load_visible(self, first, last):
+        self._lazy_load_job = None
+        total = len(self._stocks)
+        if total == 0:
+            return
+            
+        # Calculate indexes visible, add a small padding of 5
+        start_idx = max(0, int(first * total) - 5)
+        end_idx = min(total - 1, int(last * total) + 5)
+        
+        targets = []
+        token = self._load_token
+        
+        # Update from cache first, collect non-cached
+        for idx in range(start_idx, end_idx + 1):
+            s = self._stocks[idx]
+            code = s.get("itemCode", "")
+            if not code:
+                continue
+            if code in self._details_cache:
+                c = self._details_cache[code]
+                s["_low52"] = c["lo"]
+                s["_high52"] = c["hi"]
+                s["_dividend"] = c["div"]
+                s["_div_yield"] = c["div_yield"]
+                s["_div_dt"] = c["div_dt"]
+                s["_div_y1"] = c["div_y1"]
+                s["_div_y2"] = c["div_y2"]
+                s["_div_y3"] = c["div_y3"]
+                self._update_details_row(idx, c["lo"], c["hi"], c["div"], c["div_yield"], c["div_dt"], c["div_y1"], c["div_y2"], c["div_y3"], token)
+            else:
+                targets.append((idx, s))
+                
+        if not targets:
+            return
+            
+        # Fetch non-cached ones in background
+        threading.Thread(target=self._fetch_batch_details, args=(targets, token), daemon=True).start()
+
+    def _fetch_batch_details(self, targets: list, token: int):
+        if token != self._load_token:
+            return
+
+        def work_naver(idx_s):
+            idx, s = idx_s
+            code = s.get("itemCode", "")
+            lo, hi, div, div_yield, div_dt, close_price = _fetch_naver_details(code)
+            return idx, code, lo, hi, div, div_yield, div_dt, close_price
+
+        # Phase 1: Fetch Naver details in parallel
+        naver_results = []
+        try:
+            with ThreadPoolExecutor(max_workers=8) as ex:
+                futs = [ex.submit(work_naver, t) for t in targets]
+                for fut in as_completed(futs):
+                    if token != self._load_token:
+                        return
+                    try:
+                        idx, code, lo, hi, div, div_yield, div_dt, close_price = fut.result()
+                        # Update the stock dict immediately
+                        self._stocks[idx]["_low52"] = lo
+                        self._stocks[idx]["_high52"] = hi
+                        self._stocks[idx]["_dividend"] = div
+                        self._stocks[idx]["_div_yield"] = div_yield
+                        self._stocks[idx]["_div_dt"] = div_dt
+                        
+                        # Update row immediately with Naver details (and "…" for yfinance)
+                        self.root.after(0, self._update_details_row, idx, lo, hi, div, div_yield, div_dt, "…", "…", "…", token)
+                        naver_results.append((idx, code, lo, hi, div, div_yield, div_dt, close_price))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        if token != self._load_token or not naver_results:
+            return
+
+        # Phase 2: Fetch yfinance details in parallel
+        def work_yfinance(res):
+            idx, code, lo, hi, div, div_yield, div_dt, close_price = res
+            div, div_yield, div_dt, div_y1, div_y2, div_y3 = _fetch_yfinance_dividends(code, close_price, div, div_yield, div_dt)
+            return idx, code, lo, hi, div, div_yield, div_dt, div_y1, div_y2, div_y3
+
+        try:
+            with ThreadPoolExecutor(max_workers=3) as ex:
+                futs = [ex.submit(work_yfinance, r) for r in naver_results]
+                for fut in as_completed(futs):
+                    if token != self._load_token:
+                        return
+                    try:
+                        idx, code, lo, hi, div, div_yield, div_dt, div_y1, div_y2, div_y3 = fut.result()
+                        # Update the stock dict with final values
+                        self._stocks[idx]["_low52"] = lo
+                        self._stocks[idx]["_high52"] = hi
+                        self._stocks[idx]["_dividend"] = div
+                        self._stocks[idx]["_div_yield"] = div_yield
+                        self._stocks[idx]["_div_dt"] = div_dt
+                        self._stocks[idx]["_div_y1"] = div_y1
+                        self._stocks[idx]["_div_y2"] = div_y2
+                        self._stocks[idx]["_div_y3"] = div_y3
+                        
+                        # Cache the result
+                        self._details_cache[code] = {
+                            "lo": lo, "hi": hi,
+                            "div": div, "div_yield": div_yield, "div_dt": div_dt,
+                            "div_y1": div_y1, "div_y2": div_y2, "div_y3": div_y3
+                        }
+                        
+                        # Update the UI row with final values
+                        self.root.after(0, self._update_details_row, idx, lo, hi, div, div_yield, div_dt, div_y1, div_y2, div_y3, token)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
     # ──────────────────────────────────────────────
     # 선택 헬퍼
@@ -1190,16 +1698,32 @@ class IndustrySectorSection:
             self._set_stats_for_current()
 
     def _attach_details(self, stocks: list):
+        # 1. Fill from cache first
+        for i, s in enumerate(stocks):
+            code = s.get("itemCode", "")
+            if code in self._details_cache:
+                c = self._details_cache[code]
+                s["_low52"] = c["lo"]
+                s["_high52"] = c["hi"]
+                s["_dividend"] = c["div"]
+                s["_div_yield"] = c["div_yield"]
+                s["_div_dt"] = c["div_dt"]
+                s["_div_y1"] = c["div_y1"]
+                s["_div_y2"] = c["div_y2"]
+                s["_div_y3"] = c["div_y3"]
+
         targets = [(i, s) for i, s in enumerate(stocks) if "_low52" not in s]
         if not targets:
             return
 
         def work(i_s):
             i, s = i_s
-            return (i, *_fetch_details(s.get("itemCode", "")))
+            code = s.get("itemCode", "")
+            lo, hi, div, div_yield, div_dt, div_y1, div_y2, div_y3 = _fetch_details(code)
+            return i, code, lo, hi, div, div_yield, div_dt, div_y1, div_y2, div_y3
 
         with ThreadPoolExecutor(max_workers=12) as ex:
-            for i, lo, hi, div, div_yield, div_dt, div_y1, div_y2, div_y3 in ex.map(work, targets):
+            for i, code, lo, hi, div, div_yield, div_dt, div_y1, div_y2, div_y3 in ex.map(work, targets):
                 stocks[i]["_low52"]  = lo
                 stocks[i]["_high52"] = hi
                 stocks[i]["_dividend"] = div
@@ -1208,6 +1732,13 @@ class IndustrySectorSection:
                 stocks[i]["_div_y1"] = div_y1
                 stocks[i]["_div_y2"] = div_y2
                 stocks[i]["_div_y3"] = div_y3
+                
+                # Cache it
+                self._details_cache[code] = {
+                    "lo": lo, "hi": hi,
+                    "div": div, "div_yield": div_yield, "div_dt": div_dt,
+                    "div_y1": div_y1, "div_y2": div_y2, "div_y3": div_y3
+                }
 
     def _rows_for_stocks(self, stocks: list, sector_name: str) -> list:
         rows = []
@@ -1243,10 +1774,19 @@ class IndustrySectorSection:
             self._write_csv(alt, rows)
 
     def _write_csv(self, path: str, rows: list):
+        # Excel에서 열었을 때 종목코드(3번째 컬럼)의 leading zero가 유지되도록 ="005930" 형식으로 저장
+        formatted_rows = []
+        for r in rows:
+            new_row = list(r)
+            if len(new_row) > 2:
+                code = new_row[2]
+                new_row[2] = f'="{code}"'
+            formatted_rows.append(new_row)
+
         with open(path, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.writer(f)
             w.writerow(EXPORT_HEADER)
-            w.writerows(rows)
+            w.writerows(formatted_rows)
 
     def _write_xlsx(self, path: str, rows: list):
         from openpyxl import Workbook
@@ -1259,6 +1799,13 @@ class IndustrySectorSection:
         ws.append(EXPORT_HEADER)
         for r in rows:
             ws.append(r)
+
+        # 종목코드 컬럼(C열, index 3)을 텍스트 형식(@)으로 명시적 지정하여 leading zero 보존
+        for row in range(2, ws.max_row + 1):
+            cell = ws.cell(row=row, column=3)
+            cell.number_format = '@'
+            if cell.value is not None:
+                cell.value = str(cell.value)
 
         head_fill = PatternFill("solid", fgColor="1A1A1A")
         head_font = Font(bold=True, color="FFFFFF", name="맑은 고딕")
@@ -1282,24 +1829,29 @@ class IndustrySectorSection:
     # 상태표시 헬퍼(스레드 → UI)
     # ──────────────────────────────────────────────
     def _set_stats(self, text: str, color: str):
-        self.root.after(0, lambda: self.stats_lbl.configure(text=text, fg=color))
+        self._safe_after(0, lambda: self.stats_lbl.configure(text=text, fg=color) if hasattr(self, "stats_lbl") and self.stats_lbl and self.stats_lbl.winfo_exists() else None)
 
     def _set_stats_for_current(self):
         if self._current_group:
-            self.root.after(0, lambda: self._populate_stats(self._current_group))
+            self._safe_after(0, lambda: self._populate_stats(self._current_group))
 
     def _populate_stats(self, group: dict):
-        cr    = float(group.get("changeRate", 0))
-        sign  = "▲" if cr >= 0 else "▼"
-        color = "#E63B2E" if cr >= 0 else "#0055FF"
-        self.stats_lbl.configure(
-            fg=color,
-            text=(
-                f"{sign} {abs(cr):.2f}%  |  "
-                f"상승 {group['riseCount']}  하락 {group['fallCount']}  "
-                f"보합 {group['steadyCount']}  (총 {group['totalCount']}종목)"
-            ),
-        )
+        try:
+            if not hasattr(self, "stats_lbl") or not self.stats_lbl or not self.stats_lbl.winfo_exists():
+                return
+            cr    = float(group.get("changeRate", 0))
+            sign  = "▲" if cr >= 0 else "▼"
+            color = "#E63B2E" if cr >= 0 else "#0055FF"
+            self.stats_lbl.configure(
+                fg=color,
+                text=(
+                    f"{sign} {abs(cr):.2f}%  |  "
+                    f"상승 {group['riseCount']}  하락 {group['fallCount']}  "
+                    f"보합 {group['steadyCount']}  (총 {group['totalCount']}종목)"
+                ),
+            )
+        except Exception:
+            pass
 
     # ──────────────────────────────────────────────
     # 선택 종목 차트 보기 연동
@@ -1313,8 +1865,6 @@ class IndustrySectorSection:
                 messagebox.showwarning("조회 불가", "조회할 종목이 없습니다. 먼저 업종을 선택해 주세요.")
                 return
             selected = children[:5]
-        else:
-            selected = selected[:5]
 
         stocks_to_show = []
         for iid in selected:

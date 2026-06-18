@@ -58,6 +58,7 @@ class ChartViewer(tk.Toplevel):
         self.hist_data_dict = {}  # {symbol: hist_data}
         self.ticker_info_dict = {}  # {symbol: fast_info}
         self.loaded_stocks = []  # successfully loaded (symbol, name)
+        self.ax_twin = None      # Twin Y-axis for return rate (%)
         
         self._build_ui()
         self._load_data_thread()
@@ -184,6 +185,12 @@ class ChartViewer(tk.Toplevel):
             self.after(0, lambda: self._on_data_error(str(e)))
             
     def _on_data_loaded(self):
+        try:
+            if not self.winfo_exists():
+                return
+        except Exception:
+            return
+            
         if not self.loaded_stocks:
             self._on_data_error("선택한 모든 종목의 시세 데이터를 불러오지 못했습니다.")
             return
@@ -195,10 +202,20 @@ class ChartViewer(tk.Toplevel):
         self._draw_chart()
         
     def _on_data_error(self, err_msg: str):
+        try:
+            if not self.winfo_exists():
+                return
+        except Exception:
+            return
         self.loading_lbl.configure(text=f"❌ 데이터를 불러오는데 실패했습니다.\n\n오류 내용:\n{err_msg}")
         messagebox.showerror("데이터 조회 오류", f"시세 데이터를 가져오지 못했습니다:\n{err_msg}")
         
     def _update_info_panel(self):
+        try:
+            if not self.winfo_exists():
+                return
+        except Exception:
+            return
         # Clear existing widgets in price_container
         for w in self.price_container.winfo_children():
             w.destroy()
@@ -213,11 +230,17 @@ class ChartViewer(tk.Toplevel):
             prev_val = float(close_series.iloc[-2]) if len(close_series) > 1 else last_val
             
             # Try live price from fast_info if valid
-            fast_info = self.ticker_info_dict.get(symbol)
-            if fast_info and hasattr(fast_info, "last_price") and fast_info.last_price is not None:
-                last_val = float(fast_info.last_price)
-                if hasattr(fast_info, "previous_close") and fast_info.previous_close is not None:
-                    prev_val = float(fast_info.previous_close)
+            try:
+                fast_info = self.ticker_info_dict.get(symbol)
+                if fast_info:
+                    last_price = getattr(fast_info, "last_price", None)
+                    if last_price is not None:
+                        last_val = float(last_price)
+                        prev_close = getattr(fast_info, "previous_close", None)
+                        if prev_close is not None:
+                            prev_val = float(prev_close)
+            except Exception as e:
+                print(f"Error fetching fast_info for {symbol}: {e}")
                     
             chg = last_val - prev_val
             chg_rt = (chg / prev_val) * 100 if prev_val else 0.0
@@ -255,6 +278,11 @@ class ChartViewer(tk.Toplevel):
     def _draw_chart(self):
         self.ax.clear()
         
+        # Reset or clear twin axis if it exists
+        if hasattr(self, "ax_twin") and self.ax_twin is not None:
+            self.ax_twin.clear()
+            self.ax_twin.get_yaxis().set_visible(False)
+        
         # Grid styling
         self.ax.grid(True, linestyle="--", alpha=0.5, color=self.text_muted)
         
@@ -277,11 +305,38 @@ class ChartViewer(tk.Toplevel):
                 # Single stock: Plot absolute price
                 is_up = prices[-1] >= prices[0]
                 line_color = "#E63B2E" if is_up else "#0055FF"
-                self.ax.plot(dates, prices, color=line_color, linewidth=2, label=name)
+                self.ax.plot(dates, prices, color=line_color, linewidth=2, label=f"{name} 시세")
                 # Fill under the line
                 self.ax.fill_between(dates, prices, min(prices)*0.99, facecolor=line_color, alpha=0.1)
                 
-                title_str = f"{name} ({symbol}) - {self.current_period} 시세 변동"
+                # Draw a dotted reference line at the initial price (0.00% return)
+                initial_price = prices[0]
+                if initial_price > 0:
+                    self.ax.axhline(initial_price, color=self.text_muted, linestyle=":", alpha=0.6, label="기준가 (0.00%)")
+                    
+                    # Create/configure twin Y-axis for return rate (%)
+                    if not hasattr(self, "ax_twin") or self.ax_twin is None:
+                        self.ax_twin = self.ax.twinx()
+                    else:
+                        self.ax_twin.get_yaxis().set_visible(True)
+                    
+                    # Align twin axis limits to match absolute prices precisely
+                    ymin, ymax = self.ax.get_ylim()
+                    ymin_pct = ((ymin / initial_price) - 1.0) * 100.0
+                    ymax_pct = ((ymax / initial_price) - 1.0) * 100.0
+                    self.ax_twin.set_ylim(ymin_pct, ymax_pct)
+                    self.ax_twin.get_yaxis().set_major_formatter(
+                        matplotlib.ticker.FuncFormatter(lambda x, p: f"{x:+.1f}%")
+                    )
+                    self.ax_twin.tick_params(colors=self.text_dark, labelsize=9)
+                    self.ax_twin.set_ylabel("수익률 (%)", color=self.text_dark, fontdict={"fontsize": 9, "fontweight": "bold"})
+                    
+                    # Set borders/spines style on the twin axis
+                    for spine in self.ax_twin.spines.values():
+                        spine.set_edgecolor(self.border_color)
+                        spine.set_linewidth(1.5)
+                
+                title_str = f"{name} ({symbol}) - {self.current_period} 시세 및 수익률"
             else:
                 # Multiple stocks: Plot relative return (%)
                 initial_price = prices[0]
@@ -291,6 +346,10 @@ class ChartViewer(tk.Toplevel):
                 self.ax.plot(dates, returns, color=line_color, linewidth=2, label=name)
                 
                 title_str = f"선택 종목 {self.current_period} 수익률 비교 (%)"
+        
+        # Draw a baseline at 0.00% for multi-stock returns
+        if is_multi:
+            self.ax.axhline(0, color=self.text_muted, linestyle=":", alpha=0.6, label="기준선 (0.00%)")
                 
         # Set titles & labels
         self.ax.set_title(title_str, fontdict={"fontsize": 11, "fontweight": "bold", "color": self.text_dark})
